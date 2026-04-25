@@ -1,0 +1,1340 @@
+-- Server anti-cheat
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService  = game:GetService("DataStoreService")
+local HttpService       = game:GetService("HttpService")
+
+local BanStore = DataStoreService:GetDataStore("GuardianBans_v2")
+local LogStore = DataStoreService:GetDataStore("GuardianLogs_v2")
+
+-- ================================================
+-- CONFIGURACIÓN CENTRAL
+-- ================================================
+local CONFIG = {
+    -- ── Velocidad ───────────────────────────────
+    MAX_SPEED            = 60,   -- studs/s en suelo
+    MAX_SPEED_JUMP       = 90,   -- studs/s en el aire (salto legítimo)
+    MAX_AIR_TIME         = 3,    -- segundos en el aire antes de usar umbral terrestre (anti-fly)
+    SPEED_CHECK_INTERVAL = 0.5,
+
+    -- ── Disparos ────────────────────────────────
+    MAX_SHOOT_ORIGIN_DISTANCE = 12,
+    MAX_SHOOT_RATE            = 10,   -- disparos por segundo
+    MAX_SHOOT_DISTANCE        = 500,
+    MAX_AIM_ANGLE             = 35,   -- grados maximos entre camara y direccion
+    MAX_SNAP_ANGLE            = 25,   -- grados de snap en 0.5 s que delatan silent aim
+    MAX_SILENT_AIM_ANGLE      = 18,   -- grados para mismatch fuerte en dirección de disparo
+    BASE_HUMAN_REACTION_MS    = 145,
+    MAX_HUMAN_REACTION_MS     = 170,
+    TARGET_MEMORY_WINDOW      = 0.35,
+    MAX_TRACKLESS_SWITCH_ANGLE = 40,  -- salto angular sin transición progresiva
+    MAX_DIRECTION_DEVIATION   = 30,   -- limite de desviacion aceptable
+    AIM_SAMPLE_INTERVAL       = 0.1,  -- muestreo de objetivo visible
+    MAX_REACH_DISTANCE        = 180,
+    SHOOT_EVENT_NAMES         = {"ShootEvent", "WeaponShoot", "FireWeapon"},
+    ALLOW_UNKNOWN_SHOOT_EVENT = false,
+    SHOOT_TOKEN_TTL           = 25,
+    REQUIRE_SHOOT_TOKEN       = true,
+    SHOOT_TOKEN_MIN_INTERVAL  = 0.3,
+    TARGET_CACHE_TTL          = 0.15,
+
+    -- ── Aimbot ──────────────────────────────────
+    MAX_HEADSHOT_RATE    = 0.80,
+    HEADSHOT_SAMPLE_SIZE = 15,   -- reducido: detecta aimbot más rápido (15 vs 25 disparos)
+    HS_STREAK_THRESHOLD   = 7,    -- racha de headshots consecutivos inusual
+
+    -- ── Silent aim scoring ──────────────────────
+    SUSPICION_DECAY_PER_SEC = 0.85, -- decaimiento del score por segundo
+    SUSPICION_WARN_SCORE    = 18,   -- alerta admin
+    SUSPICION_FLAG_SCORE    = 30,   -- flag formal
+    SUSPICION_KICK_SCORE    = 50,   -- kick por patrón sostenido
+
+    -- ── Noclip ──────────────────────────────────
+    NOCLIP_CHECK_INTERVAL = 0.3,  -- segundos entre chequeos (reducido para capturar paredes finas)
+    NOCLIP_WALL_THRESHOLD = 1.5,  -- studs dentro de una parte sólida
+
+    -- ── God mode ────────────────────────────────
+    -- Si el jugador recibe 10+ impactos registrados sin bajar HP, flag
+    GOD_MODE_HIT_THRESHOLD = 10,
+    GOD_MODE_HEALTH_STALE_SEC = 2.5,
+
+    -- ── Sistema de flags ────────────────────────
+    FLAGS_TO_KICK        = 5,
+    FLAGS_TO_BAN         = 10,
+
+    -- ── Cooldown entre flags del mismo tipo ─────
+    -- Evita spam de flags por un mismo evento repetido
+    FLAG_COOLDOWN        = 2,
+    FLAG_COOLDOWN_PING_FACTOR = 0.004,
+    MAX_PING_LENIENCY_MS = 220,
+    UNVERIFIED_SCORE_MULTIPLIER = 1.25,
+    ROUND_ROBIN_BATCH_SIZE = 12,
+    SPEED_FREEFALL_VEL_Z_THRESHOLD = 120,
+
+    LOG_FLUSH_INTERVAL = 6,
+    LOG_BATCH_SIZE     = 40,
+    RECENT_BAN_CACHE_SEC = 600,
+
+    -- ── Severidad ───────────────────────────────
+    -- "LOW"  → solo warn en consola
+    -- "MED"  → warn + acumula flag
+    -- "HIGH" → flag + kick inmediato si hay 3+ previas
+    SEVERITY_THRESHOLDS = {
+        speed         = "MED",
+        shoot_origin  = "MED",
+        shoot_rate    = "HIGH",
+        headshot      = "HIGH",
+        hit_mismatch  = "HIGH",
+        noclip        = "HIGH",
+        god_mode      = "HIGH",
+        silent_aim    = "HIGH",  -- aimbot / silent aim
+        new_account   = "LOW",   -- cuenta nueva (posible ban evader)
+        inf_jump      = "MED",   -- saltos excesivos (infinite jump hack)
+    },
+
+    -- ── Saltos ──────────────────────────────────
+    MAX_JUMPS_PER_SEC    = 3,    -- más de 3 saltos/s → infinite jump
+
+    -- ── Acción base ─────────────────────────────
+    ACTION = "flag",  -- "warn" | "flag" | "kick"
+
+    -- ── Admins ──────────────────────────────────
+    AdminIds = {
+        -- Agrega tus UserId aquí: ejemplo 123456789
+    },
+
+    -- ── Anti ban-evasión ─────────────────────────
+    -- Cuentas con menos días de antigüedad reciben flag LOW para revisión manual
+    -- Pon en 0 para desactivar
+    MIN_ACCOUNT_AGE = 7,
+}
+
+-- ================================================
+-- ESTADO INTERNO
+-- ================================================
+local playerData = {}
+local flagLog    = {}
+local MAX_LOG    = 200
+local logBuffer  = {}
+local playerListCache = {}
+local rrIndex = 1
+local recentBanCache = {}
+local handleViolation
+local saveLog
+local sendFullUpdate
+
+-- ================================================
+-- UTILIDADES
+-- ================================================
+local function ts()
+    return os.date("%H:%M:%S", os.time())
+end
+
+local function debugEmit(runId, hypothesisId, location, message, data)
+    local payload = {
+        sessionId = "9ac516",
+        runId = runId,
+        hypothesisId = hypothesisId,
+        location = location,
+        message = message,
+        data = data or {},
+        timestamp = math.floor(time() * 1000),
+    }
+    local wroteLocal = false
+    if io and io.open then
+        pcall(function()
+            local f = io.open("debug-9ac516.log", "a")
+            if f then
+                f:write(HttpService:JSONEncode(payload), "\n")
+                f:close()
+                wroteLocal = true
+            end
+        end)
+    end
+    if wroteLocal then
+        return
+    end
+    local okReq, reqRes = pcall(function()
+        return HttpService:RequestAsync({
+            Url = "http://127.0.0.1:7810/ingest/ae5a6435-873d-4a15-9988-be1614de5348",
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["X-Debug-Session-Id"] = "9ac516",
+            },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not okReq then
+        warn("[DebugEmit] ingest request failed")
+    else
+        -- #region agent log
+        warn(("[DebugEmit] ingest status=%s body=%s"):format(
+            tostring(reqRes and reqRes.StatusCode),
+            tostring(reqRes and reqRes.Body)
+        ))
+        -- #endregion
+    end
+end
+
+-- #region agent log
+debugEmit("baseline", "H0", "Untitled-1.ini:startup", "instrumentation_loaded", {
+    httpEnabled = (HttpService.HttpEnabled == true),
+})
+-- #endregion
+
+local function isAdmin(player)
+    for _, id in ipairs(CONFIG.AdminIds) do
+        if player.UserId == id then return true end
+    end
+    return false
+end
+
+local function initData(player)
+    playerData[player.UserId] = {
+        -- Velocidad
+        lastPos       = nil,
+        lastPosTime   = time(),
+
+        -- Disparos
+        shots         = 0,
+        headshots     = 0,
+        shotsThisSec  = 0,
+        shotSecStart  = time(),
+        lastShotTs    = 0,
+        shotTokens    = CONFIG.MAX_SHOOT_RATE,
+        shotTokenTs   = time(),
+
+        -- God mode
+        hitsReceived  = 0,
+        lastHP        = 100,
+        lastHPDropTs  = time(),
+
+        -- Flags
+        flags         = 0,
+        lastFlagTime  = {},  -- [tipo] = timestamp de cooldown por tipo
+
+        -- Noclip
+        lastNoclipCheck = time(),
+
+        -- Fly / air-time tracking
+        airTime         = 0,
+
+        -- Silent aim: historial de LookVector (últimos 0.5 s)
+        lookBuffer      = {},
+        recentTargets   = {},    -- historial de targets observados por servidor (LOS)
+        headshotStreak  = 0,
+        suspicionScore  = 0,
+        suspicionLastTs = time(),
+        lastAimTargetId = nil,
+        lastAimTargetTs = 0,
+        reactionSamples = {},
+        shotWindow      = {},
+        mismatchWindow  = {},
+        sessionToken    = "",
+        tokenExpireTs   = 0,
+        lastTokenRequestTs = 0,
+        tokenUseNonce = "",
+        isUnverifiedBanState = false,
+        targetCache = nil,
+        targetCacheTs = 0,
+        lastShotDistance = 0,
+    }
+end
+
+local function clampDot(a)
+    return math.clamp(a, -1, 1)
+end
+
+local function angleBetween(a, b)
+    if a.Magnitude <= 0 or b.Magnitude <= 0 then return 180 end
+    return math.deg(math.acos(clampDot(a.Unit:Dot(b.Unit))))
+end
+
+local function isFiniteNumber(v)
+    return typeof(v) == "number" and v == v and v > -math.huge and v < math.huge
+end
+
+local function isFiniteVector3(v)
+    return typeof(v) == "Vector3"
+        and isFiniteNumber(v.X)
+        and isFiniteNumber(v.Y)
+        and isFiniteNumber(v.Z)
+end
+
+local function getPingMs(player)
+    local ok, pingSeconds = pcall(function()
+        return player:GetNetworkPing()
+    end)
+    if not ok or not isFiniteNumber(pingSeconds) then
+        return 0
+    end
+    local pingMs = pingSeconds * 1000
+    if pingMs < 0 then return 0 end
+    return math.min(pingMs, CONFIG.MAX_PING_LENIENCY_MS)
+end
+
+local function pingFactor(player)
+    return getPingMs(player) / 1000
+end
+
+local function randomToken()
+    local a = math.random(100000, 999999)
+    local b = math.random(100000, 999999)
+    return string.format("%x%x%x", os.time(), a, b)
+end
+
+local function refreshSessionToken(data)
+    data.sessionToken = randomToken()
+    data.tokenExpireTs = time() + CONFIG.SHOOT_TOKEN_TTL
+    data.tokenUseNonce = randomToken()
+end
+
+local function ensureSessionToken(data)
+    if data.sessionToken == "" or time() >= data.tokenExpireTs then
+        refreshSessionToken(data)
+    end
+    return data.sessionToken
+end
+
+local function dynamicReactionThreshold(player)
+    local threshold = CONFIG.BASE_HUMAN_REACTION_MS + (getPingMs(player) * 0.2)
+    return math.clamp(threshold, CONFIG.BASE_HUMAN_REACTION_MS, CONFIG.MAX_HUMAN_REACTION_MS)
+end
+
+local function decaySuspicion(data, now)
+    local elapsed = math.max(0, now - (data.suspicionLastTs or now))
+    data.suspicionLastTs = now
+    if elapsed <= 0 then return end
+    data.suspicionScore = data.suspicionScore * math.pow(CONFIG.SUSPICION_DECAY_PER_SEC, elapsed)
+end
+
+local function pushReactionSample(data, ms)
+    table.insert(data.reactionSamples, ms)
+    while #data.reactionSamples > 20 do
+        table.remove(data.reactionSamples, 1)
+    end
+end
+
+local function addSuspicion(player, reason, points)
+    local data = playerData[player.UserId]
+    if not data then return end
+    local now = time()
+    decaySuspicion(data, now)
+    if data.isUnverifiedBanState then
+        points *= CONFIG.UNVERIFIED_SCORE_MULTIPLIER
+    end
+    data.suspicionScore += points
+
+    if data.suspicionScore >= CONFIG.SUSPICION_KICK_SCORE then
+        handleViolation(player, ("SilentAim score crítico %.1f: %s"):format(data.suspicionScore, reason), "silent_aim")
+        player:Kick("Anti-cheat: patrón de silent aim sostenido")
+        return
+    end
+
+    if data.suspicionScore >= CONFIG.SUSPICION_FLAG_SCORE then
+        handleViolation(player, ("SilentAim score %.1f: %s"):format(data.suspicionScore, reason), "silent_aim")
+    elseif data.suspicionScore >= CONFIG.SUSPICION_WARN_SCORE then
+        saveLog(player.UserId, player.Name, ("ALERTA SilentAim score %.1f: %s"):format(data.suspicionScore, reason), "WARN")
+    end
+end
+
+saveLog = function(userId, name, reason, severity)
+    local entry = {
+        time     = os.time(),
+        name     = name,
+        userId   = userId,
+        reason   = reason,
+        severity = severity,
+    }
+
+    table.insert(flagLog, 1, string.format(
+        "[%s][%s] %s (%d) — %s", ts(), severity, name, userId, reason
+    ))
+    if #flagLog > MAX_LOG then table.remove(flagLog) end
+    table.insert(logBuffer, entry)
+end
+
+local function flushLogs()
+    if #logBuffer == 0 then return end
+    local grouped = {}
+    local take = math.min(#logBuffer, CONFIG.LOG_BATCH_SIZE)
+    for _ = 1, take do
+        local entry = table.remove(logBuffer, 1)
+        local key = "log_" .. entry.userId
+        grouped[key] = grouped[key] or {}
+        table.insert(grouped[key], entry)
+    end
+
+    for key, entries in pairs(grouped) do
+        task.spawn(function()
+            pcall(function()
+                LogStore:UpdateAsync(key, function(old)
+                    local logs = old or {}
+                    for i = 1, #entries do
+                        table.insert(logs, 1, entries[i])
+                    end
+                    while #logs > 50 do table.remove(logs) end
+                    return logs
+                end)
+            end)
+        end)
+    end
+end
+
+-- ================================================
+-- BAN PERMANENTE
+-- ================================================
+local function banPlayer(player, reason)
+    recentBanCache[player.UserId] = time() + CONFIG.RECENT_BAN_CACHE_SEC
+    task.spawn(function()
+        pcall(function()
+            BanStore:UpdateAsync(tostring(player.UserId), function()
+                return {
+                    banned = true,
+                    reason = reason,
+                    time   = os.time(),
+                    name   = player.Name,
+                }
+            end)
+        end)
+    end)
+    saveLog(player.UserId, player.Name, "BANEADO: " .. reason, "BAN")
+    warn(("[AntiCheat] BAN: %s (%d) - %s"):format(player.Name, player.UserId, reason))
+    player:Kick("Baneado permanentemente: " .. reason)
+end
+
+local function isBanned(userId)
+    local cacheExp = recentBanCache[userId]
+    if cacheExp and cacheExp > time() then
+        return true, "recent_ban_cache"
+    end
+    local ok, result = pcall(function() return BanStore:GetAsync(tostring(userId)) end)
+    if not ok then
+        return false, "DataStore_unavailable"
+    end
+    return result and result.banned, (result and result.reason or nil)
+end
+
+local function unbanPlayer(userId)
+    return pcall(function()
+        BanStore:UpdateAsync(tostring(userId), function(old)
+            local data = old or {}
+            data.banned = false
+            return data
+        end)
+    end)
+end
+
+-- ================================================
+-- SISTEMA DE VIOLACIONES CON SEVERIDAD Y COOLDOWN
+-- ================================================
+handleViolation = function(player, reason, violationType)
+    local data = playerData[player.UserId]
+    if not data then return end
+
+    local severity = CONFIG.SEVERITY_THRESHOLDS[violationType] or "MED"
+
+    -- Cooldown por tipo de violación
+    local lastTime = data.lastFlagTime[violationType] or 0
+    local cooldown = CONFIG.FLAG_COOLDOWN + (getPingMs(player) * CONFIG.FLAG_COOLDOWN_PING_FACTOR)
+    if time() - lastTime < cooldown then return end
+    data.lastFlagTime[violationType] = time()
+
+    -- LOW: solo consola
+    if severity == "LOW" then
+        warn(("[AntiCheat] INFO %s - %s"):format(player.Name, reason))
+        saveLog(player.UserId, player.Name, reason, "INFO")
+        return
+    end
+
+    -- MED / HIGH: acumular flag
+    data.flags += 1
+    saveLog(player.UserId, player.Name, reason, "WARN")
+    warn(("[AntiCheat] WARN %s (%d) [%s] - %s [flags:%d]"):format(
+        player.Name, player.UserId, severity, reason, data.flags
+    ))
+
+    -- Broadcast a admins online
+    local AdminUpdate = ReplicatedStorage:FindFirstChild("AdminGUI_Update")
+    if AdminUpdate then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if isAdmin(p) then
+                AdminUpdate:FireClient(p, {
+                    type   = "newFlag",
+                    player = player.Name,
+                    userId = player.UserId,
+                    reason = reason,
+                    flags  = data.flags,
+                })
+            end
+        end
+    end
+
+    -- Ban automático
+    if data.flags >= CONFIG.FLAGS_TO_BAN then
+        banPlayer(player, "Infracciones acumuladas: " .. reason)
+        return
+    end
+
+    -- Kick por umbral o HIGH+flags previas
+    if CONFIG.ACTION == "kick"
+    or data.flags >= CONFIG.FLAGS_TO_KICK
+    or (severity == "HIGH" and data.flags >= 3) then
+        player:Kick("Anti-cheat: " .. reason)
+    end
+end
+
+-- ================================================
+--  VELOCIDAD + NOCLIP
+-- ================================================
+
+local function getVisibleAimTarget(player, root)
+    local data = playerData[player.UserId]
+    local now = time()
+    if data and data.targetCache and (now - data.targetCacheTs) <= CONFIG.TARGET_CACHE_TTL then
+        return data.targetCache.target, data.targetCache.angle
+    end
+
+    local best, bestAngle
+    local second, secondAngle
+    local origin = root.Position
+    local look = root.CFrame.LookVector
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player then
+            local och = other.Character
+            local oHum = och and och:FindFirstChildOfClass("Humanoid")
+            local oRoot = och and och:FindFirstChild("HumanoidRootPart")
+            if oHum and oRoot and oHum.Health > 0 then
+                local delta = oRoot.Position - origin
+                local distance = delta.Magnitude
+                if distance > 2 and distance <= 220 then
+                    local angle = angleBetween(look, delta)
+                    if angle <= 22 then
+                        if not bestAngle or angle < bestAngle then
+                            second, secondAngle = best, bestAngle
+                            best, bestAngle = other, angle
+                        elseif not secondAngle or angle < secondAngle then
+                            second, secondAngle = other, angle
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = {player.Character}
+
+    local function validate(candidate)
+        if not candidate then return nil end
+        local c = candidate.Character
+        local cRoot = c and c:FindFirstChild("HumanoidRootPart")
+        if not cRoot then return nil end
+        local delta = cRoot.Position - origin
+        local hit = workspace:Raycast(origin, delta.Unit * delta.Magnitude, rp)
+        if hit and hit.Instance and hit.Instance:IsDescendantOf(c) then
+            return candidate
+        end
+        return nil
+    end
+
+    local v1 = validate(best)
+    if v1 then
+        if data then
+            data.targetCache = {target = v1, angle = bestAngle}
+            data.targetCacheTs = now
+        end
+        return v1, bestAngle
+    end
+    local v2 = validate(second)
+    if v2 then
+        if data then
+            data.targetCache = {target = v2, angle = secondAngle}
+            data.targetCacheTs = now
+        end
+        return v2, secondAngle
+    end
+    if data then
+        data.targetCache = {target = nil, angle = nil}
+        data.targetCacheTs = now
+    end
+    return nil, nil
+end
+
+-- Noclip: comprobar si el HumanoidRootPart está dentro de una parte sólida
+local function checkNoclip(player)
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local overlapParams = OverlapParams.new()
+    overlapParams.FilterDescendantsInstances = {char}
+    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local broad = workspace:GetPartBoundsInRadius(root.Position, 4.5, overlapParams)
+    if #broad == 0 then
+        return
+    end
+
+    local parts = workspace:GetPartsInPart(root, overlapParams)
+    local tolerance = CONFIG.NOCLIP_WALL_THRESHOLD + (pingFactor(player) * 3)
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") and part.CanCollide == true
+        and part.Transparency < 0.9
+        and not part:IsDescendantOf(char) then
+            local delta = (root.Position - part.Position).Magnitude
+            if delta > (part.Size.Magnitude * 0.75 + tolerance) then
+                continue
+            end
+            handleViolation(player,
+                "Posible noclip detectado (dentro de: " .. part.Name .. ")",
+                "noclip"
+            )
+            return
+        end
+    end
+end
+
+local speedTimer   = 0
+local noclipTimer  = 0
+local aimTimer     = 0
+
+RunService.Heartbeat:Connect(function(dt)
+    speedTimer  += dt
+    noclipTimer += dt
+    aimTimer    += dt
+
+    local doSpeed  = speedTimer  >= CONFIG.SPEED_CHECK_INTERVAL
+    local doNoclip = noclipTimer >= CONFIG.NOCLIP_CHECK_INTERVAL
+    local doAim    = aimTimer    >= CONFIG.AIM_SAMPLE_INTERVAL
+
+    if not doSpeed and not doNoclip and not doAim then return end
+
+    local now = time()
+
+    local players = Players:GetPlayers()
+    local total = #players
+    if total == 0 then
+        if doSpeed  then speedTimer  = 0 end
+        if doNoclip then noclipTimer = 0 end
+        if doAim    then aimTimer    = 0 end
+        return
+    end
+
+    local batch = math.min(CONFIG.ROUND_ROBIN_BATCH_SIZE, total)
+    if rrIndex > total then rrIndex = 1 end
+
+    for i = 1, batch do
+        local idx = rrIndex + i - 1
+        if idx > total then idx -= total end
+        local player = players[idx]
+        local data = playerData[player.UserId]
+        if not data then continue end
+
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum or hum.Health <= 0 then continue end
+
+        -- ── Registro de LookVector (anti silent aim multi-frame) ─────────
+        local look = root.CFrame.LookVector
+        table.insert(data.lookBuffer, {t = now, v = look})
+        -- Mantener solo los últimos 0.5 s
+        while data.lookBuffer[1] and now - data.lookBuffer[1].t > 0.5 do
+            table.remove(data.lookBuffer, 1)
+        end
+
+        if doAim then
+            local target, targetAngle = getVisibleAimTarget(player, root)
+            if target then
+                if data.lastAimTargetId ~= target.UserId then
+                    data.lastAimTargetId = target.UserId
+                    data.lastAimTargetTs = now
+                end
+                table.insert(data.recentTargets, {
+                    t = now,
+                    targetId = target.UserId,
+                    angle = targetAngle or 0,
+                })
+            end
+            while data.recentTargets[1] and now - data.recentTargets[1].t > CONFIG.TARGET_MEMORY_WINDOW do
+                table.remove(data.recentTargets, 1)
+            end
+        end
+
+        -- Decaimiento pasivo del score cuando el comportamiento vuelve a normalidad
+        decaySuspicion(data, now)
+
+        -- ── Velocidad + fly + traversal de paredes ──────
+        if doSpeed then
+            local pos = root.Position
+            if data.lastPos then
+                local elapsed = now - data.lastPosTime
+                if elapsed > 0 then
+                    local delta = pos - data.lastPos
+                    local speed = delta.Magnitude / elapsed
+
+                    -- Tracking de tiempo en el aire (anti-fly lento)
+                    local inAir = hum.FloorMaterial == Enum.Material.Air
+                    if inAir then
+                        data.airTime = data.airTime + elapsed
+                    else
+                        data.airTime = 0
+                    end
+
+                    -- Umbral alto en el aire SOLO durante los primeros MAX_AIR_TIME segundos
+                    local maxSpeed = (inAir and data.airTime <= CONFIG.MAX_AIR_TIME)
+                        and CONFIG.MAX_SPEED_JUMP
+                        or  CONFIG.MAX_SPEED
+                    maxSpeed += (getPingMs(player) * 0.03)
+                    local vel = root.AssemblyLinearVelocity
+                    if inAir and vel.Y < -CONFIG.SPEED_FREEFALL_VEL_Z_THRESHOLD then
+                        maxSpeed += 35
+                    end
+
+                    if speed > maxSpeed then
+                        -- #region agent log
+                        debugEmit("baseline", "H4", "Untitled-1.ini:heartbeat:speed", "speed above threshold", {
+                            userId = player.UserId,
+                            speed = speed,
+                            maxSpeed = maxSpeed,
+                            inAir = inAir,
+                            airTime = data.airTime,
+                            pingMs = getPingMs(player),
+                            velY = root.AssemblyLinearVelocity.Y,
+                        })
+                        -- #endregion
+                        handleViolation(player,
+                            ("Velocidad anómala: %.1f studs/s (máx: %d, airTime: %.1fs)"):format(
+                                speed, maxSpeed, data.airTime),
+                            "speed"
+                        )
+                    end
+
+                    -- Noclip via Spherecast: detecta traversal de paredes entre ticks
+                    if delta.Magnitude > 0.3 then
+                        local sweepParams = RaycastParams.new()
+                        sweepParams.FilterDescendantsInstances = {char}
+                        sweepParams.FilterType = Enum.RaycastFilterType.Exclude
+                        local sweep = workspace:Spherecast(
+                            data.lastPos, 1.5, delta, sweepParams
+                        )
+                        if sweep and sweep.Instance:IsA("BasePart")
+                        and sweep.Instance.CanCollide
+                        and sweep.Instance.Transparency < 0.9 then
+                            handleViolation(player,
+                                "Traversal de pared detectado (noclip): " .. sweep.Instance.Name,
+                                "noclip"
+                            )
+                        end
+                    end
+                end
+            end
+            data.lastPos     = root.Position
+            data.lastPosTime = now
+        end
+
+        -- ── Noclip ───────────────────────────────────
+        if doNoclip then
+            checkNoclip(player)
+        end
+
+        -- ── God mode (HP no baja) ────────────────────
+        local currentHP = hum.Health
+        if currentHP < data.lastHP then
+            data.hitsReceived = 0
+            data.lastHPDropTs = now
+        elseif data.hitsReceived >= CONFIG.GOD_MODE_HIT_THRESHOLD then
+            if now - data.lastHPDropTs > CONFIG.GOD_MODE_HEALTH_STALE_SEC then
+                handleViolation(player,
+                    "Posible god mode: " .. data.hitsReceived .. " impactos sin bajar HP",
+                    "god_mode"
+                )
+                data.hitsReceived = 0
+            end
+        end
+        data.lastHP = currentHP
+    end
+
+    rrIndex += batch
+
+    if doSpeed  then speedTimer  = 0 end
+    if doNoclip then noclipTimer = 0 end
+    if doAim    then aimTimer    = 0 end
+end)
+
+-- ================================================
+--  (Silent Aim / Aimbot)
+-- ================================================
+local boundShootEvents = {}
+local ShootTokenFunction = ReplicatedStorage:FindFirstChild("ShootToken")
+if not ShootTokenFunction then
+    ShootTokenFunction = Instance.new("RemoteFunction")
+    ShootTokenFunction.Name = "ShootToken"
+    ShootTokenFunction.Parent = ReplicatedStorage
+end
+
+local function findRecentTargetSample(data, userId)
+    for i = #data.recentTargets, 1, -1 do
+        local s = data.recentTargets[i]
+        if s.targetId == userId then
+            return s
+        end
+    end
+    return nil
+end
+
+local function pushWindow(window, now, value, maxAge)
+    table.insert(window, {t = now, v = value})
+    while window[1] and now - window[1].t > maxAge do
+        table.remove(window, 1)
+    end
+end
+
+local function windowRatio(window)
+    if #window == 0 then return 0 end
+    local total = 0
+    for i = 1, #window do
+        total += (window[i].v and 1 or 0)
+    end
+    return total / #window
+end
+
+local function processShoot(player, origin, direction, hitPartName, sourceEventName, token, tokenNonce)
+        local data = playerData[player.UserId]
+        if not data then return end
+
+        local now = time()
+        -- #region agent log
+        debugEmit("baseline", "H1", "Untitled-1.ini:processShoot:entry", "processShoot entry", {
+            userId = player.UserId,
+            sourceEventName = sourceEventName,
+            hasToken = token ~= nil,
+            hasNonce = tokenNonce ~= nil,
+            originType = typeof(origin),
+            directionType = typeof(direction),
+        })
+        -- #endregion
+        local expectedToken = ensureSessionToken(data)
+        if CONFIG.REQUIRE_SHOOT_TOKEN then
+            if token ~= expectedToken then
+                -- #region agent log
+                debugEmit("baseline", "H1", "Untitled-1.ini:processShoot:token", "token mismatch", {
+                    userId = player.UserId,
+                    sourceEventName = sourceEventName,
+                    expectedTokenLen = #tostring(expectedToken or ""),
+                    providedTokenLen = #tostring(token or ""),
+                })
+                -- #endregion
+                addSuspicion(player, "token de disparo invalido", 10)
+                return
+            end
+            if tokenNonce ~= data.tokenUseNonce then
+                -- #region agent log
+                debugEmit("baseline", "H1", "Untitled-1.ini:processShoot:nonce", "nonce mismatch", {
+                    userId = player.UserId,
+                    sourceEventName = sourceEventName,
+                })
+                -- #endregion
+                addSuspicion(player, "nonce de disparo invalido", 10)
+                return
+            end
+            data.tokenUseNonce = randomToken()
+        elseif token and token ~= expectedToken then
+            addSuspicion(player, "token de disparo desfasado", 4)
+        end
+
+        -- Rate limiting por ventana y token bucket
+        if now - data.shotSecStart >= 1 then
+            data.shotsThisSec = 0
+            data.shotSecStart = now
+        end
+        data.shotsThisSec += 1
+        local shotDelta = (data.lastShotTs > 0) and (now - data.lastShotTs) or 999
+        data.lastShotTs = now
+
+        local elapsedTokens = math.max(0, now - data.shotTokenTs)
+        data.shotTokenTs = now
+        data.shotTokens = math.min(CONFIG.MAX_SHOOT_RATE, data.shotTokens + (elapsedTokens * CONFIG.MAX_SHOOT_RATE))
+        data.shotTokens -= 1
+
+        if data.shotsThisSec > CONFIG.MAX_SHOOT_RATE then
+            handleViolation(player,
+                "Rate de disparo excesivo: " .. data.shotsThisSec .. "/s",
+                "shoot_rate"
+            )
+            return
+        end
+        if data.shotTokens < -2 then
+            handleViolation(player, "Burst de disparo excesivo", "shoot_rate")
+            return
+        end
+
+        if not isFiniteVector3(origin) or not isFiniteVector3(direction) or direction.Magnitude < 0.001 then
+            handleViolation(player, "Datos de disparo inválidos", "shoot_origin")
+            return
+        end
+
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+
+        local currentLook = root.CFrame.LookVector
+        local directionUnit = direction.Unit
+        local deviationAllowance = CONFIG.MAX_DIRECTION_DEVIATION + (getPingMs(player) * 0.03)
+        local deviation = angleBetween(directionUnit, currentLook)
+        if deviation > deviationAllowance then
+            -- #region agent log
+            debugEmit("baseline", "H2", "Untitled-1.ini:processShoot:deviation", "deviation above allowance", {
+                userId = player.UserId,
+                deviation = deviation,
+                deviationAllowance = deviationAllowance,
+                pingMs = getPingMs(player),
+            })
+            -- #endregion
+            addSuspicion(player, ("direccion desvía %.1f° del look"):format(deviation), 8)
+            if deviation > deviationAllowance * 1.6 then
+                return
+            end
+        end
+
+        local dist = (origin - root.Position).Magnitude
+        if dist > CONFIG.MAX_SHOOT_ORIGIN_DISTANCE then
+            handleViolation(player,
+                ("Origen de disparo lejano: %.1f studs"):format(dist),
+                "shoot_origin"
+            )
+            return
+        end
+
+        
+            local alignCurrent = angleBetween(directionUnit, currentLook)
+
+            -- Buscar entrada más antigua (≥ 0.25 s atrás) en el buffer
+            local oldEntry = nil
+            for i = 1, #data.lookBuffer do
+                if now - data.lookBuffer[i].t >= 0.25 then
+                    oldEntry = data.lookBuffer[i]
+                    break
+                end
+            end
+
+            if oldEntry then
+                local snapAngle  = angleBetween(currentLook, oldEntry.v)
+                local alignOld   = angleBetween(directionUnit, oldEntry.v)
+
+                -- Snap brusco + disparo alinea con look nuevo pero NO con el viejo = silent aim
+                if snapAngle > CONFIG.MAX_SNAP_ANGLE
+                and alignCurrent <= CONFIG.MAX_AIM_ANGLE
+                and alignOld     >  CONFIG.MAX_AIM_ANGLE then
+                    addSuspicion(player,
+                        ("snap %.1f° + mismatch histórico (actual %.1f° / previo %.1f°)"):format(
+                            snapAngle, alignCurrent, alignOld),
+                        12
+                    )
+                end
+            end
+
+            -- Check de respaldo: ángulo muy desalineado de forma imposible para tiro legítimo
+            if alignCurrent > CONFIG.MAX_AIM_ANGLE * 1.6 then
+                addSuspicion(player,
+                    ("ángulo extremo %.1f° contra cámara visible"):format(alignCurrent),
+                    8
+                )
+            end
+        end
+
+        -- Raycast del servidor
+        local rp = RaycastParams.new()
+        rp.FilterDescendantsInstances = {char}
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+
+        local result = workspace:Raycast(origin, directionUnit * CONFIG.MAX_SHOOT_DISTANCE, rp)
+        if not result then return end
+
+        local serverPart = result.Instance.Name
+        data.lastShotDistance = (result.Position - origin).Magnitude
+
+        -- Comparar hit part (el cliente SIEMPRE debe reportar la parte golpeada)
+        if hitPartName == nil then
+            addSuspicion(player,
+                ("cliente no reporta hitPart; servidor='%s'"):format(serverPart),
+                6
+            )
+            pushWindow(data.mismatchWindow, now, true, 8)
+        elseif hitPartName ~= serverPart then
+            addSuspicion(player,
+                ("hit mismatch cliente='%s' servidor='%s'"):format(tostring(hitPartName), serverPart),
+                5
+            )
+            pushWindow(data.mismatchWindow, now, true, 8)
+        else
+            pushWindow(data.mismatchWindow, now, false, 8)
+        end
+
+        -- Estadísticas aimbot
+        data.shots += 1
+        local isHeadshot = (serverPart == "Head")
+        pushWindow(data.shotWindow, now, isHeadshot, 12)
+        if isHeadshot then
+            data.headshots += 1
+            data.headshotStreak += 1
+        else
+            data.headshotStreak = 0
+        end
+
+        -- Registrar impacto para god mode
+        local hitModel  = result.Instance:FindFirstAncestorOfClass("Model")
+        local hitPlayer = hitModel and Players:GetPlayerFromCharacter(hitModel)
+        if hitPlayer then
+            local hitRoot = hitPlayer.Character and hitPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hitRoot then
+                local reachDistance = (root.Position - hitRoot.Position).Magnitude
+                local reachLimit = CONFIG.MAX_REACH_DISTANCE + (getPingMs(player) * 0.2)
+                if reachDistance > reachLimit then
+                    addSuspicion(player, ("reach %.1f > %.1f"):format(reachDistance, reachLimit), 10)
+                    return
+                end
+            end
+
+            -- Tiempo de reacción: objetivo adquirido por LOS server-side -> disparo
+            local sample = findRecentTargetSample(data, hitPlayer.UserId)
+            if sample then
+                local reactionMs = math.max(0, (now - sample.t) * 1000)
+                pushReactionSample(data, reactionMs)
+                local reactionThreshold = dynamicReactionThreshold(player)
+                if reactionMs < reactionThreshold then
+                    addSuspicion(player,
+                        ("reacción %.0fms contra %s"):format(reactionMs, hitPlayer.Name),
+                        4
+                    )
+                end
+            end
+
+            -- Tracking invisible: cambio de target con salto angular fuerte sin transición
+            local prevTargetId = data.lastAimTargetId
+            if prevTargetId and prevTargetId ~= hitPlayer.UserId then
+                local prevPlayer = Players:GetPlayerByUserId(prevTargetId)
+                local prevRoot = prevPlayer and prevPlayer.Character and prevPlayer.Character:FindFirstChild("HumanoidRootPart")
+                local newRoot = hitPlayer.Character and hitPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if prevRoot and newRoot then
+                    local oldAngle = angleBetween(root.CFrame.LookVector, prevRoot.Position - root.Position)
+                    local newAngle = angleBetween(root.CFrame.LookVector, newRoot.Position - root.Position)
+                    local switchDelta = math.abs(oldAngle - newAngle)
+                    if switchDelta > CONFIG.MAX_TRACKLESS_SWITCH_ANGLE then
+                        addSuspicion(player,
+                            ("target-switch %.1f° sin tracking progresivo"):format(switchDelta),
+                            7
+                        )
+                    end
+                end
+            end
+            data.lastAimTargetId = hitPlayer.UserId
+            data.lastAimTargetTs = now
+
+            local hitData = playerData[hitPlayer.UserId]
+            if hitData then
+                hitData.hitsReceived += 1
+                if hitData.hitsReceived >= CONFIG.GOD_MODE_HIT_THRESHOLD then
+                    handleViolation(hitPlayer,
+                        "Posible god mode: " .. hitData.hitsReceived .. " impactos sin bajar HP",
+                        "god_mode"
+                    )
+                    hitData.hitsReceived = 0
+                end
+            end
+        end
+
+        -- Evaluar headshot rate
+        if data.shots % CONFIG.HEADSHOT_SAMPLE_SIZE == 0 then
+            local rate = data.headshots / data.shots
+            if rate > CONFIG.MAX_HEADSHOT_RATE then
+                addSuspicion(player,
+                    ("headshot rate %.0f%% en %d disparos"):format(rate * 100, data.shots),
+                    10
+                )
+            end
+        end
+
+        local hsWindowRate = windowRatio(data.shotWindow)
+        if #data.shotWindow >= 8 and hsWindowRate >= 0.85 then
+            local movingTargetFactor = 0
+            if hitPlayer and hitPlayer.Character then
+                local hrp = hitPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    movingTargetFactor = hrp.AssemblyLinearVelocity.Magnitude
+                end
+            end
+            if (movingTargetFactor > 12 or shotDelta < 0.2) and data.lastShotDistance >= 45 then
+                -- #region agent log
+                debugEmit("baseline", "H3", "Untitled-1.ini:processShoot:headshot-window", "headshot window suspicion", {
+                    userId = player.UserId,
+                    hsWindowRate = hsWindowRate,
+                    movingTargetFactor = movingTargetFactor,
+                    shotDelta = shotDelta,
+                    distance = data.lastShotDistance,
+                })
+                -- #endregion
+                addSuspicion(player, ("headshot window %.0f%%"):format(hsWindowRate * 100), 8)
+            end
+        end
+
+        local mismatchRate = windowRatio(data.mismatchWindow)
+        if #data.mismatchWindow >= 6 and mismatchRate >= 0.5 then
+            addSuspicion(player, ("mismatch window %.0f%%"):format(mismatchRate * 100), 6)
+        end
+
+        if not sourceEventName then
+            addSuspicion(player, "shot sin evento fuente", 3)
+        end
+
+        -- Rachas largas de headshots elevan score, pero no banean por sí solas.
+        if data.headshotStreak >= CONFIG.HS_STREAK_THRESHOLD then
+            addSuspicion(player,
+                ("racha de %d headshots consecutivos"):format(data.headshotStreak),
+                5
+            )
+        end
+end
+
+local function bindShootRemote(remote)
+    if not remote or not remote:IsA("RemoteEvent") then return end
+    if boundShootEvents[remote] then return end
+    boundShootEvents[remote] = true
+    remote.OnServerEvent:Connect(function(player, origin, direction, hitPartName, token, tokenNonce)
+        processShoot(player, origin, direction, hitPartName, remote.Name, token, tokenNonce)
+    end)
+end
+
+for _, remoteName in ipairs(CONFIG.SHOOT_EVENT_NAMES) do
+    local remote = ReplicatedStorage:FindFirstChild(remoteName)
+    if remote and remote:IsA("RemoteEvent") then
+        bindShootRemote(remote)
+    end
+end
+
+ReplicatedStorage.DescendantAdded:Connect(function(instance)
+    if not instance:IsA("RemoteEvent") then return end
+    local allowed = CONFIG.ALLOW_UNKNOWN_SHOOT_EVENT
+    if not allowed then
+        for _, n in ipairs(CONFIG.SHOOT_EVENT_NAMES) do
+            if instance.Name == n then
+                allowed = true
+                break
+            end
+        end
+    end
+    if allowed then
+        bindShootRemote(instance)
+    end
+end)
+
+if ShootTokenFunction and ShootTokenFunction:IsA("RemoteFunction") then
+    ShootTokenFunction.OnServerInvoke = function(player)
+        local data = playerData[player.UserId]
+        if not data then return nil end
+        local now = time()
+        if (now - data.lastTokenRequestTs) < CONFIG.SHOOT_TOKEN_MIN_INTERVAL then
+            addSuspicion(player, "token request spam", 3)
+            return nil
+        end
+        data.lastTokenRequestTs = now
+        ensureSessionToken(data)
+        return {
+            token = data.sessionToken,
+            nonce = data.tokenUseNonce,
+            expireAt = data.tokenExpireTs,
+        }
+    end
+end
+
+-- ================================================
+-- EVENTOS DE JUGADORES
+-- ================================================
+Players.PlayerAdded:Connect(function(player)
+    task.spawn(function()
+        local banned, reason = isBanned(player.UserId)
+        -- #region agent log
+        debugEmit("baseline", "H5", "Untitled-1.ini:player-added:isBanned", "isBanned result", {
+            userId = player.UserId,
+            banned = banned == true,
+            reason = reason,
+        })
+        -- #endregion
+        if banned then
+            player:Kick("Baneado permanentemente: " .. (reason or "Cheating"))
+            return
+        end
+        initData(player)
+        local data = playerData[player.UserId]
+        if data then
+            refreshSessionToken(data)
+            if reason == "DataStore_unavailable" then
+                data.isUnverifiedBanState = true
+                addSuspicion(player, "sesion no verificada", 6)
+            end
+        end
+        saveLog(player.UserId, player.Name, "Sesión iniciada", "INFO")
+
+        -- Anti ban-evasión: flag si la cuenta es muy nueva
+        if CONFIG.MIN_ACCOUNT_AGE > 0 and player.AccountAge < CONFIG.MIN_ACCOUNT_AGE then
+            handleViolation(player,
+                ("Cuenta nueva sospechosa: %d días de antigüedad (mín: %d)"):format(
+                    player.AccountAge, CONFIG.MIN_ACCOUNT_AGE),
+                "new_account"
+            )
+        end
+
+        player.CharacterAdded:Connect(function(char)
+            local d = playerData[player.UserId]
+            if d then
+                d.lastPos      = nil
+                d.lastPosTime  = time()
+                d.hitsReceived = 0
+                d.lookBuffer   = {}  -- resetear historial al respawnear
+                d.airTime      = 0
+                d.lastHPDropTs = time()
+                refreshSessionToken(d)
+            end
+
+            -- ── Detección de Infinite Jump ─────────────────────────────
+            local hum2 = char:WaitForChild("Humanoid", 5)
+            if not hum2 then return end
+            local jumpCount    = 0
+            local jumpSecStart = time()
+            hum2.Jumping:Connect(function(isActive)
+                if not isActive then return end
+                local now2 = time()
+                if now2 - jumpSecStart >= 1 then
+                    jumpCount    = 0
+                    jumpSecStart = now2
+                end
+                jumpCount += 1
+                if jumpCount > CONFIG.MAX_JUMPS_PER_SEC then
+                    handleViolation(player,
+                        ("Infinite jump: %d saltos/s (máx %d)"):format(
+                            jumpCount, CONFIG.MAX_JUMPS_PER_SEC),
+                        "inf_jump"
+                    )
+                end
+            end)
+        end)
+
+        -- Enviar snapshot al admin si corresponde (fusionado del segundo PlayerAdded)
+        task.wait(2)
+        if isAdmin(player) then sendFullUpdate(player) end
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    saveLog(player.UserId, player.Name, "Sesión cerrada", "INFO")
+    playerData[player.UserId] = nil
+end)
+
+for _, p in ipairs(Players:GetPlayers()) do initData(p) end
+
+-- ================================================
+-- GUI ADMIN 
+-- ================================================
+local AdminUpdate  = ReplicatedStorage:FindFirstChild("AdminGUI_Update")
+local AdminCommand = ReplicatedStorage:FindFirstChild("AdminGUI_Command")
+
+sendFullUpdate = function(admin)
+    if not AdminUpdate then return end
+    local online = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        local d = playerData[p.UserId]
+        online[p.Name] = {
+            userId    = p.UserId,
+            flags     = d and d.flags or 0,
+            shots     = d and d.shots or 0,
+            headshots = d and d.headshots or 0,
+        }
+    end
+    AdminUpdate:FireClient(admin, {
+        type    = "fullUpdate",
+        players = online,
+        logs    = flagLog,
+    })
+end
+
+if AdminCommand and AdminCommand:IsA("RemoteFunction") then
+    AdminCommand.OnServerInvoke = function(admin, command, targetId)
+        if not isAdmin(admin) then
+            return { success = false, msg = "Sin permisos de admin." }
+        end
+
+        if command == "kick" then
+            local t = Players:GetPlayerByUserId(targetId)
+            if t then
+                t:Kick("Expulsado por admin: " .. admin.Name)
+                saveLog(targetId, t.Name, "Kick manual por " .. admin.Name, "WARN")
+                return { success = true, msg = t.Name .. " expulsado." }
+            end
+            return { success = false, msg = "Jugador no encontrado online." }
+
+        elseif command == "ban" then
+            local t = Players:GetPlayerByUserId(targetId)
+            if t then
+                banPlayer(t, "Ban manual por " .. admin.Name)
+                return { success = true, msg = t.Name .. " baneado." }
+            else
+                pcall(function()
+                    BanStore:UpdateAsync(tostring(targetId), function()
+                        return {
+                            banned = true,
+                            reason = "Ban manual por " .. admin.Name,
+                            time   = os.time(), name = "?",
+                        }
+                    end)
+                end)
+                return { success = true, msg = "Ban aplicado (jugador offline)." }
+            end
+
+        elseif command == "unban" then
+            local ok = unbanPlayer(targetId)
+            if ok then
+                saveLog(targetId, "?", "Desbaneado por " .. admin.Name, "INFO")
+                return { success = true, msg = "Jugador desbaneado." }
+            end
+            return { success = false, msg = "Error al desbanear." }
+
+        elseif command == "clearFlags" then
+            local t = Players:GetPlayerByUserId(targetId)
+            if t and playerData[targetId] then
+                playerData[targetId].flags = 0
+                saveLog(targetId, t.Name, "Flags borradas por " .. admin.Name, "INFO")
+                return { success = true, msg = "Flags borradas." }
+            end
+            return { success = false, msg = "Jugador no encontrado." }
+
+        elseif command == "getLogs" then
+            return { success = true, logs = flagLog }
+        end
+
+        return { success = false, msg = "Comando desconocido." }
+    end
+end
+
+
+task.spawn(function()
+    while true do
+        task.wait(5)
+        for _, p in ipairs(Players:GetPlayers()) do
+            if isAdmin(p) then sendFullUpdate(p) end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(CONFIG.LOG_FLUSH_INTERVAL)
+        flushLogs()
+    end
+end)
+
+print("[AntiCheat] Guardian activo")

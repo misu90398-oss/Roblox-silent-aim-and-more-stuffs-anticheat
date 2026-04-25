@@ -1,0 +1,21 @@
+Features
+Server-side validation (no client trust)
+Speed, fly, and noclip detection
+Server raycast hit verification
+Aimbot & silent aim detection (multi-frame analysis)
+Shot rate limiting (token bucket system)
+Token + nonce security against remote spoofing
+Headshot rate and streak analysis
+Reaction time and target tracking checks
+Reach and god mode detection
+Infinite jump detection
+Suspicion scoring with decay system
+Adaptive thresholds based on ping
+DataStore-based bans and log system
+Batched logging for performance
+Real-time admin alerts and commands
+Optimized with round-robin processing
+
+This project is still in active development.
+Fully open-ource  you are free to modify and adapt it to your needs
+ If you want to contact me to see versions of the anticheat, something is wrong, or you need help using it in your game, you can contact me on my Discord: z5lj
